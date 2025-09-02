@@ -1,706 +1,943 @@
-import asyncio
-import json
-import requests
 from web3 import Web3
+from web3.exceptions import TransactionNotFound
 from eth_account import Account
-import time
-import os
+from eth_utils import to_hex, to_bytes
+from curl_cffi import requests
+from fake_useragent import FakeUserAgent
+from datetime import datetime
+from colorama import *
+import asyncio, random, json, os, pytz
 
-# Pharos Testnet configuration
-RPC_URL = "https://testnet.dplabs-internal.com"
-CHAIN_ID = 688688
-KYC_API_URL = "https://www.spout.finance/api/kyc-signature"
+wib = pytz.timezone('Asia/Jakarta')
 
-# Contract addresses
-IDENTITY_FACTORY_CONTRACT = "0x18cB5F2774a80121d1067007933285B32516226a"
-GATEWAY_CONTRACT = "0x126F0c11F3e5EafE37AB143D4AA688429ef7DCB3"
-ORDERS_CONTRACT = "0x81b33972f8bdf14fD7968aC99CAc59BcaB7f4E9A"
-USDC_CONTRACT = "0x72df0bcd7276f2dFbAc900D1CE63c272C4BCcCED"
-RWA_TOKEN_CONTRACT = "0x54b753555853ce22f66Ac8CB8e324EB607C4e4eE"
-
-# ABIs
-IDENTITY_FACTORY_ABI = [
-    {"inputs": [{"internalType": "address", "name": "_wallet", "type": "address"}, {"internalType": "string", "name": "_salt", "type": "string"}], "name": "createIdentity", "outputs": [{"internalType": "address", "name": "", "type": "address"}], "stateMutability": "nonpayable", "type": "function"},
-    {"inputs": [{"internalType": "address", "name": "_wallet", "type": "address"}], "name": "getIdentity", "outputs": [{"internalType": "address", "name": "", "type": "address"}], "stateMutability": "view", "type": "function"}
-]
-
-IDENTITY_ABI = [
-    {"inputs": [{"internalType": "uint256", "name": "_topic", "type": "uint256"}, {"internalType": "uint256", "name": "_scheme", "type": "uint256"}, {"internalType": "address", "name": "_issuer", "type": "address"}, {"internalType": "bytes", "name": "_signature", "type": "bytes"}, {"internalType": "bytes", "name": "_data", "type": "bytes"}, {"internalType": "string", "name": "_uri", "type": "string"}], "name": "addClaim", "outputs": [{"internalType": "bytes32", "name": "claimRequestId", "type": "bytes32"}], "stateMutability": "nonpayable", "type": "function"},
-    {"inputs": [{"internalType": "uint256", "name": "_topic", "type": "uint256"}], "name": "getClaimIdsByTopic", "outputs": [{"internalType": "bytes32[]", "name": "claimIds", "type": "bytes32[]"}], "stateMutability": "view", "type": "function"}
-]
-
-USDC_ABI = [
-    {"inputs": [{"internalType": "address", "name": "_spender", "type": "address"}, {"internalType": "uint256", "name": "_value", "type": "uint256"}], "name": "approve", "outputs": [{"internalType": "bool", "name": "", "type": "bool"}], "stateMutability": "nonpayable", "type": "function"},
-    {"inputs": [{"internalType": "address", "name": "_owner", "type": "address"}], "name": "balanceOf", "outputs": [{"internalType": "uint256", "name": "balance", "type": "uint256"}], "stateMutability": "view", "type": "function"},
-    {"inputs": [], "name": "decimals", "outputs": [{"internalType": "uint8", "name": "", "type": "uint8"}], "stateMutability": "view", "type": "function"}
-]
-
-RWA_TOKEN_ABI = [
-    {"inputs": [{"internalType": "address", "name": "_spender", "type": "address"}, {"internalType": "uint256", "name": "_value", "type": "uint256"}], "name": "approve", "outputs": [{"internalType": "bool", "name": "", "type": "bool"}], "stateMutability": "nonpayable", "type": "function"},
-    {"inputs": [{"internalType": "address", "name": "_owner", "type": "address"}], "name": "balanceOf", "outputs": [{"internalType": "uint256", "name": "balance", "type": "uint256"}], "stateMutability": "view", "type": "function"},
-    {"inputs": [], "name": "decimals", "outputs": [{"internalType": "uint8", "name": "", "type": "uint8"}], "stateMutability": "view", "type": "function"}
-]
-
-ORDERS_ABI = [
-    {"inputs": [{"internalType": "uint256", "name": "adfsFeedId", "type": "uint256"}, {"internalType": "string", "name": "ticker", "type": "string"}, {"internalType": "address", "name": "token", "type": "address"}, {"internalType": "uint256", "name": "usdcAmount", "type": "uint256"}], "name": "buyAsset", "outputs": [], "stateMutability": "nonpayable", "type": "function"},
-    {"inputs": [{"internalType": "uint256", "name": "feedId", "type": "uint256"}, {"internalType": "string", "name": "ticker", "type": "string"}, {"internalType": "address", "name": "token", "type": "address"}, {"internalType": "uint256", "name": "tokenAmount", "type": "uint256"}], "name": "sellAsset", "outputs": [], "stateMutability": "nonpayable", "type": "function"},
-    {"inputs": [{"internalType": "uint256", "name": "feedId", "type": "uint256"}], "name": "getAssetPrice", "outputs": [{"internalType": "uint256", "name": "", "type": "uint256"}], "stateMutability": "view", "type": "function"}
-]
-
-def load_private_keys():
-    try:
-        with open("accounts.txt", "r") as f:
-            lines = f.readlines()
-        private_keys = [line.strip() for line in lines if line.strip()]
-        return private_keys
-    except FileNotFoundError:
-        print("❌ accounts.txt file not found!")
-        return []
-
-def get_web3():
-    w3 = Web3(Web3.HTTPProvider(RPC_URL))
-    if not w3.is_connected():
-        raise Exception("Cannot connect to Pharos testnet")
-    return w3
-
-def get_kyc_signature(user_address, onchain_id):
-    payload = {
-        "userAddress": user_address,
-        "onchainIDAddress": onchain_id,
-        "claimData": "KYC passed",
-        "topic": 1,
-        "countryCode": 91
-    }
-    
-    headers = {
-        'Content-Type': 'application/json',
-        'Accept': 'application/json',
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
-    }
-    
-    try:
-        response = requests.post(KYC_API_URL, json=payload, headers=headers, timeout=30)
-        if response.status_code == 200:
-            return response.json()
-        else:
-            print(f"❌ KYC API error: {response.status_code}")
-            # Return fallback data
-            return {
-                "signature": {
-                    "r": "0xb2e2622d765ed8c5ba78ffa490cecd95693571031b3954ca429925e69ed15f57",
-                    "s": "0x614a040deef613d026382a9f745ff13963a75ff8a6f4032b177350a25364f8c4",
-                    "v": 28
-                },
-                "issuerAddress": "0x92b9baA72387Fb845D8Fe88d2a14113F9cb2C4E7",
-                "dataHash": "0x7de3cf25b2741629c9158f89f92258972961d4357b9f027487765f655caec367",
-                "topic": 1
-            }
-    except Exception as e:
-        print(f"⚠️ Using fallback KYC data: {e}")
-        return {
-            "signature": {
-                "r": "0xb2e2622d765ed8c5ba78ffa490cecd95693571031b3954ca429925e69ed15f57",
-                "s": "0x614a040deef613d026382a9f745ff13963a75ff8a6f4032b177350a25364f8c4",
-                "v": 28
+class Spout:
+    def __init__(self) -> None:
+        self.BASE_API = "https://www.spout.finance/api"
+        self.RPC_URL = "https://testnet.dplabs-internal.com/"
+        self.ZERO_CONTRACT_ADDRESS ="0x0000000000000000000000000000000000000000"
+        self.USDC_CONTRACT_ADDRESS = "0x72df0bcd7276f2dFbAc900D1CE63c272C4BCcCED"
+        self.SLQD_CONTRACT_ADDRESS = "0x54b753555853ce22f66Ac8CB8e324EB607C4e4eE"
+        self.GATEWAY_ROUTER_ADDRESS = "0x126F0c11F3e5EafE37AB143D4AA688429ef7DCB3"
+        self.FACTORY_ROUTER_ADDRESS = "0x18cB5F2774a80121d1067007933285B32516226a"
+        self.ISSUER_ROUTER_ADDRESS = "0xA5C77b623BEB3bC0071fA568de99e15Ccc06C7cb"
+        self.ORDERS_ROUTER_ADDRESS = "0x81b33972f8bdf14fD7968aC99CAc59BcaB7f4E9A"
+        self.ERC20_CONTRACT_ABI = json.loads('''[
+            {"type":"function","name":"balanceOf","stateMutability":"view","inputs":[{"name":"address","type":"address"}],"outputs":[{"name":"","type":"uint256"}]},
+            {"type":"function","name":"allowance","stateMutability":"view","inputs":[{"name":"owner","type":"address"},{"name":"spender","type":"address"}],"outputs":[{"name":"","type":"uint256"}]},
+            {"type":"function","name":"approve","stateMutability":"nonpayable","inputs":[{"name":"spender","type":"address"},{"name":"amount","type":"uint256"}],"outputs":[{"name":"","type":"bool"}]},
+            {"type":"function","name":"decimals","stateMutability":"view","inputs":[],"outputs":[{"name":"","type":"uint8"}]}
+        ]''')
+        self.SPOUT_CONTRACT_ABI = [
+            {
+                "type": "function",
+                "name": "getIdentity",
+                "stateMutability": "view",
+                "inputs": [
+                    { "internalType": "address", "name": "_wallet", "type": "address" }
+                ],
+                "outputs": [
+                    { "internalType": "address", "name": "", "type": "address" }
+                ]
             },
-            "issuerAddress": "0x92b9baA72387Fb845D8Fe88d2a14113F9cb2C4E7",
-            "dataHash": "0x7de3cf25b2741629c9158f89f92258972961d4357b9f027487765f655caec367",
-            "topic": 1
+            {
+                "type": "function",
+                "name": "getClaimIdsByTopic",
+                "stateMutability": "view",
+                "inputs": [
+                    { "internalType": "uint256", "name": "_topic", "type": "uint256" }
+                ],
+                "outputs": [
+                    { "internalType": "bytes32[]", "name": "claimIds", "type": "bytes32[]" }
+                ]
+            },
+            {
+                "type": "function",
+                "name": "deployIdentityForWallet",
+                "stateMutability": "nonpayable",
+                "inputs": [
+                    { "internalType": "address", "name": "identityOwner", "type": "address" }
+                ],
+                "outputs": [
+                    { "internalType": "address", "name": "", "type": "address" }
+                ]
+            },
+            {
+                "type": "function",
+                "name": "addClaim",
+                "stateMutability": "nonpayable",
+                "inputs": [
+                    { "internalType": "uint256", "name": "_topic", "type": "uint256" },
+                    { "internalType": "uint256", "name": "_scheme", "type": "uint256" },
+                    { "internalType": "address", "name": "_issuer", "type": "address" },
+                    { "internalType": "bytes", "name": "_signature", "type": "bytes" },
+                    { "internalType": "bytes", "name": "_data", "type": "bytes" },
+                    { "internalType": "string", "name": "_uri", "type": "string" }
+                ],
+                "outputs": [
+                    { "internalType": "bytes32", "name": "claimRequestId", "type": "bytes32" }
+                ]
+            },
+            {
+                "type": "function",
+                "name": "buyAsset",
+                "stateMutability": "nonpayable",
+                "inputs": [
+                    { "internalType": "uint256", "name": "adfsFeedId", "type": "uint256" },
+                    { "internalType": "string", "name": "ticker", "type": "string" },
+                    { "internalType": "address", "name": "token", "type": "address" },
+                    { "internalType": "uint256", "name": "usdcAmount", "type": "uint256" }
+                ],
+                "outputs": []
+            },
+            {
+                "type": "function",
+                "name": "sellAsset",
+                "stateMutability": "nonpayable",
+                "inputs": [
+                    { "internalType": "uint256", "name": "adfsFeedId", "type": "uint256" },
+                    { "internalType": "string", "name": "ticker", "type": "string" },
+                    { "internalType": "address", "name": "token", "type": "address" },
+                    { "internalType": "uint256", "name": "tokenAmount", "type": "uint256" }
+                ],
+                "outputs": []
+            }
+        ]
+        self.proxies = []
+        self.proxy_index = 0
+        self.account_proxies = {}
+        self.used_nonce = {}
+        self.identity_address = {}
+        self.trade_count = 0
+        self.usdc_amount = 0
+        self.slqd_amount = 0
+        self.min_delay = 0
+        self.max_delay = 0
+
+    def clear_terminal(self):
+        os.system('cls' if os.name == 'nt' else 'clear')
+
+    def log(self, message):
+        print(
+            f"{Fore.CYAN + Style.BRIGHT}[ {datetime.now().astimezone(wib).strftime('%x %X %Z')} ]{Style.RESET_ALL}"
+            f"{Fore.WHITE + Style.BRIGHT} | {Style.RESET_ALL}{message}",
+            flush=True
+        )
+
+    def welcome(self):
+        print(
+            f"""
+        {Fore.GREEN + Style.BRIGHT}Spout Finance{Fore.BLUE + Style.BRIGHT} Auto BOT
+            """
+            f"""
+        {Fore.GREEN + Style.BRIGHT}Rey? {Fore.YELLOW + Style.BRIGHT}<INI WATERMARK>
+            """
+        )
+
+    def format_seconds(self, seconds):
+        hours, remainder = divmod(seconds, 3600)
+        minutes, seconds = divmod(remainder, 60)
+        return f"{int(hours):02}:{int(minutes):02}:{int(seconds):02}"
+    
+    async def load_proxies(self):
+        filename = "proxy.txt"
+        try:
+            if not os.path.exists(filename):
+                self.log(f"{Fore.RED + Style.BRIGHT}File {filename} Not Found.{Style.RESET_ALL}")
+                return
+            with open(filename, 'r') as f:
+                self.proxies = [line.strip() for line in f.read().splitlines() if line.strip()]
+            
+            if not self.proxies:
+                self.log(f"{Fore.RED + Style.BRIGHT}No Proxies Found.{Style.RESET_ALL}")
+                return
+
+            self.log(
+                f"{Fore.GREEN + Style.BRIGHT}Proxies Total  : {Style.RESET_ALL}"
+                f"{Fore.WHITE + Style.BRIGHT}{len(self.proxies)}{Style.RESET_ALL}"
+            )
+        
+        except Exception as e:
+            self.log(f"{Fore.RED + Style.BRIGHT}Failed To Load Proxies: {e}{Style.RESET_ALL}")
+            self.proxies = []
+
+    def check_proxy_schemes(self, proxies):
+        schemes = ["http://", "https://", "socks4://", "socks5://"]
+        if any(proxies.startswith(scheme) for scheme in schemes):
+            return proxies
+        return f"http://{proxies}"
+
+    def get_next_proxy_for_account(self, token):
+        if token not in self.account_proxies:
+            if not self.proxies:
+                return None
+            proxy = self.check_proxy_schemes(self.proxies[self.proxy_index])
+            self.account_proxies[token] = proxy
+            self.proxy_index = (self.proxy_index + 1) % len(self.proxies)
+        return self.account_proxies[token]
+
+    def rotate_proxy_for_account(self, token):
+        if not self.proxies:
+            return None
+        proxy = self.check_proxy_schemes(self.proxies[self.proxy_index])
+        self.account_proxies[token] = proxy
+        self.proxy_index = (self.proxy_index + 1) % len(self.proxies)
+        return proxy
+    
+    def generate_address(self, account: str):
+        try:
+            account = Account.from_key(account)
+            address = account.address
+            
+            return address
+        except Exception as e:
+            return None
+        
+    def mask_account(self, account):
+        try:
+            mask_account = account[:6] + '*' * 6 + account[-6:]
+            return mask_account
+        except Exception as e:
+            return None
+        
+    async def get_web3_with_check(self, address: str, use_proxy: bool, retries=3, timeout=60):
+        request_kwargs = {"timeout": timeout}
+
+        proxy = self.get_next_proxy_for_account(address) if use_proxy else None
+
+        if use_proxy and proxy:
+            request_kwargs["proxies"] = {"http": proxy, "https": proxy}
+
+        for attempt in range(retries):
+            try:
+                web3 = Web3(Web3.HTTPProvider(self.RPC_URL, request_kwargs=request_kwargs))
+                web3.eth.get_block_number()
+                return web3
+            except Exception as e:
+                if attempt < retries - 1:
+                    await asyncio.sleep(3)
+                    continue
+                raise Exception(f"Failed to Connect to RPC: {str(e)}")
+        
+    async def get_token_balance(self, address: str, contract_address: str, use_proxy: bool):
+        try:
+            web3 = await self.get_web3_with_check(address, use_proxy)
+
+            token_contract = web3.eth.contract(address=web3.to_checksum_address(contract_address), abi=self.ERC20_CONTRACT_ABI)
+            balance = token_contract.functions.balanceOf(address).call()
+            decimals = token_contract.functions.decimals().call()
+
+            token_balance = balance / (10 ** decimals)
+
+            return token_balance
+        except Exception as e:
+            self.log(
+                f"{Fore.CYAN+Style.BRIGHT}   Message :{Style.RESET_ALL}"
+                f"{Fore.RED+Style.BRIGHT} {str(e)} {Style.RESET_ALL}"
+            )
+            return None
+        
+    async def get_identity_address(self, address: str, use_proxy: bool):
+        try:
+            web3 = await self.get_web3_with_check(address, use_proxy)
+
+            factory_address = web3.to_checksum_address(self.FACTORY_ROUTER_ADDRESS)
+            token_contract = web3.eth.contract(address=factory_address, abi=self.SPOUT_CONTRACT_ABI)
+            identity_address = token_contract.functions.getIdentity(address).call()
+
+            return identity_address
+        except Exception as e:
+            self.log(
+                f"{Fore.CYAN+Style.BRIGHT}   Message :{Style.RESET_ALL}"
+                f"{Fore.RED+Style.BRIGHT} {str(e)} {Style.RESET_ALL}"
+            )
+            return None
+        
+    async def get_claim_ids(self, address: str, use_proxy: bool):
+        try:
+            web3 = await self.get_web3_with_check(address, use_proxy)
+
+            identity_address = web3.to_checksum_address(self.identity_address[address])
+            token_contract = web3.eth.contract(address=identity_address, abi=self.SPOUT_CONTRACT_ABI)
+            claim_ids = token_contract.functions.getClaimIdsByTopic(1).call()
+
+            return claim_ids
+        except Exception as e:
+            self.log(
+                f"{Fore.CYAN+Style.BRIGHT}   Message :{Style.RESET_ALL}"
+                f"{Fore.RED+Style.BRIGHT} {str(e)} {Style.RESET_ALL}"
+            )
+            return None
+    
+    async def send_raw_transaction_with_retries(self, account, web3, tx, retries=5):
+        for attempt in range(retries):
+            try:
+                signed_tx = web3.eth.account.sign_transaction(tx, account)
+                raw_tx = web3.eth.send_raw_transaction(signed_tx.raw_transaction)
+                tx_hash = web3.to_hex(raw_tx)
+                return tx_hash
+            except TransactionNotFound:
+                pass
+            except Exception as e:
+                self.log(
+                    f"{Fore.CYAN + Style.BRIGHT}   Message :{Style.RESET_ALL}"
+                    f"{Fore.YELLOW + Style.BRIGHT} [Attempt {attempt + 1}] Send TX Error: {str(e)} {Style.RESET_ALL}"
+                )
+            await asyncio.sleep(2 ** attempt)
+        raise Exception("Transaction Hash Not Found After Maximum Retries")
+
+    async def wait_for_receipt_with_retries(self, web3, tx_hash, retries=5):
+        for attempt in range(retries):
+            try:
+                receipt = await asyncio.to_thread(web3.eth.wait_for_transaction_receipt, tx_hash, timeout=300)
+                return receipt
+            except TransactionNotFound:
+                pass
+            except Exception as e:
+                self.log(
+                    f"{Fore.CYAN + Style.BRIGHT}   Message :{Style.RESET_ALL}"
+                    f"{Fore.YELLOW + Style.BRIGHT} [Attempt {attempt + 1}] Wait for Receipt Error: {str(e)} {Style.RESET_ALL}"
+                )
+            await asyncio.sleep(2 ** attempt)
+        raise Exception("Transaction Receipt Not Found After Maximum Retries")
+    
+    async def perform_deploy_identity(self, account: str, address: str, use_proxy: bool):
+        try:
+            web3 = await self.get_web3_with_check(address, use_proxy)
+
+            contract_address = web3.to_checksum_address(self.GATEWAY_ROUTER_ADDRESS)
+            token_contract = web3.eth.contract(address=contract_address, abi=self.SPOUT_CONTRACT_ABI)
+
+            deploy_data = token_contract.functions.deployIdentityForWallet(address)
+
+            identity_address = deploy_data.call({"from": address})
+            estimated_gas = deploy_data.estimate_gas({"from": address})
+
+            max_priority_fee = web3.to_wei(1, "gwei")
+            max_fee = max_priority_fee
+
+            deploy_tx = deploy_data.build_transaction({
+                "from": web3.to_checksum_address(address),
+                "gas": int(estimated_gas * 1.2),
+                "maxFeePerGas": int(max_fee),
+                "maxPriorityFeePerGas": int(max_priority_fee),
+                "nonce": self.used_nonce[address],
+                "chainId": web3.eth.chain_id,
+            })
+
+            tx_hash = await self.send_raw_transaction_with_retries(account, web3, deploy_tx)
+            receipt = await self.wait_for_receipt_with_retries(web3, tx_hash)
+
+            block_number = receipt.blockNumber
+            self.used_nonce[address] += 1
+
+            return tx_hash, block_number, identity_address
+        except Exception as e:
+            self.log(
+                f"{Fore.CYAN+Style.BRIGHT}   Message :{Style.RESET_ALL}"
+                f"{Fore.RED+Style.BRIGHT} {str(e)} {Style.RESET_ALL}"
+            )
+            return None, None, None
+    
+    async def perform_add_claim(self, account: str, address: str, signature: bytes, use_proxy: bool):
+        try:
+            web3 = await self.get_web3_with_check(address, use_proxy)
+
+            contract_address = web3.to_checksum_address(self.identity_address[address])
+            token_contract = web3.eth.contract(address=contract_address, abi=self.SPOUT_CONTRACT_ABI)
+
+            data = to_bytes(hexstr="0x6fdd523c9e64db4a7a67716a6b20d5da5ce39e3ee59b2ca281248b18087e860")
+
+            add_claim_data = token_contract.functions.addClaim(1, 1, self.ISSUER_ROUTER_ADDRESS, signature, data, "")
+
+            claim_id = add_claim_data.call({"from": address})
+            estimated_gas = add_claim_data.estimate_gas({"from": address})
+
+            max_priority_fee = web3.to_wei(1, "gwei")
+            max_fee = max_priority_fee
+
+            add_claim_tx = add_claim_data.build_transaction({
+                "from": web3.to_checksum_address(address),
+                "gas": int(estimated_gas * 1.2),
+                "maxFeePerGas": int(max_fee),
+                "maxPriorityFeePerGas": int(max_priority_fee),
+                "nonce": self.used_nonce[address],
+                "chainId": web3.eth.chain_id,
+            })
+
+            tx_hash = await self.send_raw_transaction_with_retries(account, web3, add_claim_tx)
+            receipt = await self.wait_for_receipt_with_retries(web3, tx_hash)
+
+            block_number = receipt.blockNumber
+            self.used_nonce[address] += 1
+
+            return tx_hash, block_number, to_hex(claim_id)
+        except Exception as e:
+            self.log(
+                f"{Fore.CYAN+Style.BRIGHT}   Message :{Style.RESET_ALL}"
+                f"{Fore.RED+Style.BRIGHT} {str(e)} {Style.RESET_ALL}"
+            )
+            return None, None, None
+        
+    async def approving_token(self, account: str, address: str, router_address: str, asset_address: str, amount: int, use_proxy: bool):
+        try:
+            web3 = await self.get_web3_with_check(address, use_proxy)
+            
+            spender = web3.to_checksum_address(router_address)
+            asset = web3.to_checksum_address(asset_address)
+            token_contract = web3.eth.contract(address=asset, abi=self.ERC20_CONTRACT_ABI)
+
+            allowance = token_contract.functions.allowance(address, spender).call()
+            if allowance < amount:
+                approve_data = token_contract.functions.approve(spender, amount)
+                estimated_gas = approve_data.estimate_gas({"from": address})
+
+                max_priority_fee = web3.to_wei(1, "gwei")
+                max_fee = max_priority_fee
+
+                approve_tx = approve_data.build_transaction({
+                    "from": address,
+                    "gas": int(estimated_gas * 1.2),
+                    "maxFeePerGas": int(max_fee),
+                    "maxPriorityFeePerGas": int(max_priority_fee),
+                    "nonce": self.used_nonce[address],
+                    "chainId": web3.eth.chain_id,
+                })
+
+                tx_hash = await self.send_raw_transaction_with_retries(account, web3, approve_tx)
+                receipt = await self.wait_for_receipt_with_retries(web3, tx_hash)
+
+                block_number = receipt.blockNumber
+                self.used_nonce[address] += 1
+
+                explorer = f"https://testnet.pharosscan.xyz/tx/{tx_hash}"
+                
+                self.log(
+                    f"{Fore.CYAN+Style.BRIGHT}   Approve :{Style.RESET_ALL}"
+                    f"{Fore.GREEN+Style.BRIGHT} Success {Style.RESET_ALL}"
+                )
+                self.log(
+                    f"{Fore.CYAN+Style.BRIGHT}   Block   :{Style.RESET_ALL}"
+                    f"{Fore.WHITE+Style.BRIGHT} {block_number} {Style.RESET_ALL}"
+                )
+                self.log(
+                    f"{Fore.CYAN+Style.BRIGHT}   Tx Hash :{Style.RESET_ALL}"
+                    f"{Fore.WHITE+Style.BRIGHT} {tx_hash} {Style.RESET_ALL}"
+                )
+                self.log(
+                    f"{Fore.CYAN+Style.BRIGHT}   Explorer:{Style.RESET_ALL}"
+                    f"{Fore.WHITE+Style.BRIGHT} {explorer} {Style.RESET_ALL}"
+                )
+                await asyncio.sleep(5)
+
+            return True
+        except Exception as e:
+            raise Exception(f"Approving Token Contract Failed: {str(e)}")
+    
+    async def perform_buy_asset(self, account: str, address: str, use_proxy: bool):
+        try:
+            web3 = await self.get_web3_with_check(address, use_proxy)
+
+            amount_to_wei = int(self.usdc_amount * (10**6))
+
+            await self.approving_token(account, address, self.ORDERS_ROUTER_ADDRESS, self.USDC_CONTRACT_ADDRESS, amount_to_wei, use_proxy)
+
+            contract_address = web3.to_checksum_address(self.ORDERS_ROUTER_ADDRESS)
+            token_contract = web3.eth.contract(address=contract_address, abi=self.SPOUT_CONTRACT_ABI)
+
+            buy_data = token_contract.functions.buyAsset(2000002, "LQD", self.SLQD_CONTRACT_ADDRESS, amount_to_wei)
+
+            estimated_gas = buy_data.estimate_gas({"from": address})
+
+            max_priority_fee = web3.to_wei(1, "gwei")
+            max_fee = max_priority_fee
+
+            buy_tx = buy_data.build_transaction({
+                "from": web3.to_checksum_address(address),
+                "gas": int(estimated_gas * 1.2),
+                "maxFeePerGas": int(max_fee),
+                "maxPriorityFeePerGas": int(max_priority_fee),
+                "nonce": self.used_nonce[address],
+                "chainId": web3.eth.chain_id,
+            })
+
+            tx_hash = await self.send_raw_transaction_with_retries(account, web3, buy_tx)
+            receipt = await self.wait_for_receipt_with_retries(web3, tx_hash)
+
+            block_number = receipt.blockNumber
+            self.used_nonce[address] += 1
+
+            return tx_hash, block_number
+        except Exception as e:
+            self.log(
+                f"{Fore.CYAN+Style.BRIGHT}   Message :{Style.RESET_ALL}"
+                f"{Fore.RED+Style.BRIGHT} {str(e)} {Style.RESET_ALL}"
+            )
+            return None, None
+        
+    async def print_timer(self):
+        for remaining in range(random.randint(self.min_delay, self.max_delay), 0, -1):
+            print(
+                f"{Fore.CYAN + Style.BRIGHT}[ {datetime.now().astimezone(wib).strftime('%x %X %Z')} ]{Style.RESET_ALL}"
+                f"{Fore.WHITE + Style.BRIGHT} | {Style.RESET_ALL}"
+                f"{Fore.BLUE + Style.BRIGHT}Wait For{Style.RESET_ALL}"
+                f"{Fore.WHITE + Style.BRIGHT} {remaining} {Style.RESET_ALL}"
+                f"{Fore.BLUE + Style.BRIGHT}Seconds For Next Tx...{Style.RESET_ALL}",
+                end="\r",
+                flush=True
+            )
+            await asyncio.sleep(1)
+
+    def print_buy_asset_question(self):
+        while True:
+            try:
+                trade_count = int(input(f"{Fore.YELLOW + Style.BRIGHT}Enter Trade Count -> {Style.RESET_ALL}").strip())
+                if trade_count > 0:
+                    self.trade_count = trade_count
+                    break
+                else:
+                    print(f"{Fore.RED + Style.BRIGHT}Trade Count must be greater than 0.{Style.RESET_ALL}")
+            except ValueError:
+                print(f"{Fore.RED + Style.BRIGHT}Invalid input. Enter a float or decimal number.{Style.RESET_ALL}")
+         
+    def print_usdc_question(self):
+        while True:
+            try:
+                usdc_amount = float(input(f"{Fore.YELLOW + Style.BRIGHT}Enter USDC Amount -> {Style.RESET_ALL}").strip())
+                if usdc_amount > 0:
+                    self.usdc_amount = usdc_amount
+                    break
+                else:
+                    print(f"{Fore.RED + Style.BRIGHT}Amount must be greater than 0.{Style.RESET_ALL}")
+            except ValueError:
+                print(f"{Fore.RED + Style.BRIGHT}Invalid input. Enter a float or decimal number.{Style.RESET_ALL}")
+
+    def print_delay_question(self):
+        while True:
+            try:
+                min_delay = int(input(f"{Fore.YELLOW + Style.BRIGHT}Min Delay Each Tx -> {Style.RESET_ALL}").strip())
+                if min_delay >= 0:
+                    self.min_delay = min_delay
+                    break
+                else:
+                    print(f"{Fore.RED + Style.BRIGHT}Min Delay must be >= 0.{Style.RESET_ALL}")
+            except ValueError:
+                print(f"{Fore.RED + Style.BRIGHT}Invalid input. Enter a number.{Style.RESET_ALL}")
+
+        while True:
+            try:
+                max_delay = int(input(f"{Fore.YELLOW + Style.BRIGHT}Max Delay Each Tx -> {Style.RESET_ALL}").strip())
+                if max_delay >= min_delay:
+                    self.max_delay = max_delay
+                    break
+                else:
+                    print(f"{Fore.RED + Style.BRIGHT}Min Delay must be >= Min Delay.{Style.RESET_ALL}")
+            except ValueError:
+                print(f"{Fore.RED + Style.BRIGHT}Invalid input. Enter a number.{Style.RESET_ALL}")
+
+    def print_question(self):
+        self.print_buy_asset_question()
+        self.print_usdc_question()
+        self.print_delay_question()
+
+        while True:
+            try:
+                print(f"{Fore.WHITE + Style.BRIGHT}1. Run With Proxy{Style.RESET_ALL}")
+                print(f"{Fore.WHITE + Style.BRIGHT}2. Run Without Proxy{Style.RESET_ALL}")
+                proxy_choice = int(input(f"{Fore.BLUE + Style.BRIGHT}Choose [1/2] -> {Style.RESET_ALL}").strip())
+
+                if proxy_choice in [1, 2]:
+                    proxy_type = (
+                        "With" if proxy_choice == 1 else 
+                        "Without"
+                    )
+                    print(f"{Fore.GREEN + Style.BRIGHT}Run {proxy_type} Proxy Selected.{Style.RESET_ALL}")
+                    break
+                else:
+                    print(f"{Fore.RED + Style.BRIGHT}Please enter either 1 or 2.{Style.RESET_ALL}")
+            except ValueError:
+                print(f"{Fore.RED + Style.BRIGHT}Invalid input. Enter a number (1 or 2).{Style.RESET_ALL}")
+
+        rotate_proxy = False
+        if proxy_choice == 1:
+            while True:
+                rotate_proxy = input(f"{Fore.BLUE + Style.BRIGHT}Rotate Invalid Proxy? [y/n] -> {Style.RESET_ALL}").strip()
+
+                if rotate_proxy in ["y", "n"]:
+                    rotate_proxy = rotate_proxy == "y"
+                    break
+                else:
+                    print(f"{Fore.RED + Style.BRIGHT}Invalid input. Enter 'y' or 'n'.{Style.RESET_ALL}")
+
+        return proxy_choice, rotate_proxy
+    
+    async def check_connection(self, proxy_url=None):
+        url = "https://api.ipify.org?format=json"
+        try:
+            proxies = {"http":proxy_url, "https":proxy_url} if proxy_url else None
+            response = await asyncio.to_thread(requests.get, url=url, proxies=proxies, timeout=30, impersonate="chrome")
+            response.raise_for_status()
+            return True
+        except Exception as e:
+            self.log(
+                f"{Fore.CYAN+Style.BRIGHT}Status  :{Style.RESET_ALL}"
+                f"{Fore.RED+Style.BRIGHT} Connection Not 200 OK {Style.RESET_ALL}"
+                f"{Fore.MAGENTA+Style.BRIGHT}-{Style.RESET_ALL}"
+                f"{Fore.YELLOW+Style.BRIGHT} {str(e)} {Style.RESET_ALL}"
+            )
+            return None
+        
+    async def kyc_signature(self, address: str, proxy_url=None, retries=5):
+        url = f"{self.BASE_API}/kyc-signature"
+        data = json.dumps({
+            "userAddress":address,
+            "onchainIDAddress":self.identity_address[address],
+            "claimData":"KYC passed",
+            "topic":1,
+            "countryCode":91
+        })
+        headers = {
+            "Accept": "*/*",
+            "Accept-Language": "id-ID,id;q=0.9,en-US;q=0.8,en;q=0.7",
+            "Content-Length": str(len(data)),
+            "Content-Type": "application/json",
+            "Origin": "https://www.spout.finance",
+            "Referer": "https://www.spout.finance/app/profile?tab=kyc",
+            "Sec-Fetch-Dest": "empty",
+            "Sec-Fetch-Mode": "cors",
+            "Sec-Fetch-Site": "same-origin",
+            "User-Agent": FakeUserAgent().random
         }
+        await asyncio.sleep(3)
+        for attempt in range(retries):
+            proxies = {"http":proxy_url, "https":proxy_url} if proxy_url else None
+            try:
+                response = await asyncio.to_thread(requests.post, url=url, headers=headers, data=data, proxies=proxies, timeout=60, impersonate="chrome")
+                response.raise_for_status()
+                return response.json()
+            except (Exception, requests.RequestsError) as e:
+                if attempt < retries:
+                    await asyncio.sleep(5)
+                    continue
+                self.log(
+                    f"{Fore.CYAN+Style.BRIGHT}   Status  :{Style.RESET_ALL}"
+                    f"{Fore.RED+Style.BRIGHT} Fetch Signature Data Failed {Style.RESET_ALL}"
+                    f"{Fore.MAGENTA+Style.BRIGHT}-{Style.RESET_ALL}"
+                    f"{Fore.YELLOW+Style.BRIGHT} {str(e)} {Style.RESET_ALL}"
+                )
+                return None
+        
+    async def process_check_connection(self, address: str, use_proxy: bool, rotate_proxy: bool):
+        while True:
+            proxy = self.get_next_proxy_for_account(address) if use_proxy else None
+            self.log(
+                f"{Fore.CYAN+Style.BRIGHT}Proxy   :{Style.RESET_ALL}"
+                f"{Fore.WHITE + Style.BRIGHT} {proxy} {Style.RESET_ALL}"
+            )
 
-async def create_identity(w3, account, private_key):
-    try:
-        nonce = w3.eth.get_transaction_count(account.address)
-        gas_price = w3.to_wei('1.25', 'gwei')
-        
-        salt = f"wallet_{account.address.lower()}_{int(time.time())}"
-        
-        contract = w3.eth.contract(address=w3.to_checksum_address(IDENTITY_FACTORY_CONTRACT), abi=IDENTITY_FACTORY_ABI)
-        
-        tx = contract.functions.createIdentity(account.address, salt).build_transaction({
-            'chainId': CHAIN_ID,
-            'gas': 1000000,
-            'gasPrice': gas_price,
-            'nonce': nonce,
-            'from': account.address,
-            'value': 0
-        })
+            is_valid = await self.check_connection(proxy)
+            if not is_valid:
+                if rotate_proxy:
+                    proxy = self.rotate_proxy_for_account(address)
+                    await asyncio.sleep(1)
+                    continue
 
-        print(f"🔐 Creating identity for: {account.address}")
-        print(f"   Salt: {salt}")
-        
-        signed_tx = w3.eth.account.sign_transaction(tx, private_key)
-        tx_hash = w3.eth.send_raw_transaction(signed_tx.raw_transaction)
-        print(f"   Transaction hash: {tx_hash.hex()}")
-
-        receipt = w3.eth.wait_for_transaction_receipt(tx_hash, timeout=60)
-        
-        if receipt.status == 1 or receipt.logs:
-            print(f"✅ Identity created successfully!")
-            return receipt
-        else:
-            print(f"❌ Identity creation failed")
-            return None
-    except Exception as e:
-        print(f"❌ Error creating identity: {e}")
-        return None
-
-def get_onchain_id(w3, wallet_address):
-    try:
-        contract = w3.eth.contract(address=w3.to_checksum_address(IDENTITY_FACTORY_CONTRACT), abi=IDENTITY_FACTORY_ABI)
-        result = contract.functions.getIdentity(wallet_address).call()
-        if result and result != "0x0000000000000000000000000000000000000000":
-            return w3.to_checksum_address(result)
-        return None
-    except Exception as e:
-        print(f"❌ Error getting onchain ID: {e}")
-        return None
-
-async def add_claim(w3, account, private_key, onchain_id, kyc_response):
-    try:
-        nonce = w3.eth.get_transaction_count(account.address)
-        gas_price = w3.to_wei('1.25', 'gwei')
-
-        # Reconstruct signature
-        signature_r = kyc_response['signature']['r']
-        signature_s = kyc_response['signature']['s']
-        signature_v = kyc_response['signature']['v']
-        
-        r_hex = signature_r[2:] if signature_r.startswith('0x') else signature_r
-        s_hex = signature_s[2:] if signature_s.startswith('0x') else signature_s
-        
-        r_padded = r_hex.zfill(64)
-        s_padded = s_hex.zfill(64)
-        
-        full_signature = bytes.fromhex(r_padded + s_padded + hex(signature_v)[2:].zfill(2))
-        
-        issuer = kyc_response['issuerAddress']
-        data_hash = kyc_response['dataHash']
-        data_bytes = bytes.fromhex(data_hash[2:] if data_hash.startswith('0x') else data_hash)
-        
-        print(f"🔐 Adding KYC claim to identity: {onchain_id}")
-        print(f"   Issuer: {issuer}")
-        print(f"   Topic: {kyc_response['topic']}")
-        
-        contract = w3.eth.contract(address=onchain_id, abi=IDENTITY_ABI)
-        
-        tx = contract.functions.addClaim(
-            kyc_response['topic'],
-            1,
-            issuer,
-            full_signature,
-            data_bytes,
-            ""
-        ).build_transaction({
-            'chainId': CHAIN_ID,
-            'gas': 800000,
-            'gasPrice': gas_price,
-            'nonce': nonce,
-            'from': account.address,
-            'value': 0
-        })
-
-        signed_tx = w3.eth.account.sign_transaction(tx, private_key)
-        tx_hash = w3.eth.send_raw_transaction(signed_tx.raw_transaction)
-        print(f"   Transaction hash: {tx_hash.hex()}")
-
-        receipt = w3.eth.wait_for_transaction_receipt(tx_hash, timeout=60)
-        
-        if receipt.status == 1 or receipt.logs:
-            print(f"✅ KYC claim added successfully!")
-            return receipt
-        else:
-            print(f"❌ KYC claim addition failed")
-            return None
-    except Exception as e:
-        print(f"❌ Error adding claim: {e}")
-        return None
-
-async def run_kyc_process():
-    print("\n" + "="*60)
-    print("🔐 KYC PROCESS - IDENTITY CREATION & VERIFICATION")
-    print("="*60)
-    
-    w3 = get_web3()
-    private_keys = load_private_keys()
-    
-    if not private_keys:
-        print("❌ No private keys found!")
-        return
-    
-    for i, private_key in enumerate(private_keys):
-        account = Account.from_key(private_key)
-        print(f"\n📱 Processing Account {i+1}/{len(private_keys)}: {account.address}")
-        
-        # Check balance
-        balance = w3.eth.get_balance(account.address)
-        balance_eth = w3.from_wei(balance, 'ether')
-        print(f"   Balance: {balance_eth} PHRS")
-        
-        if balance == 0:
-            print("   ❌ No balance, skipping...")
-            continue
-        
-        # Check existing identity
-        existing_id = get_onchain_id(w3, account.address)
-        if existing_id:
-            print(f"   ✅ Identity exists: {existing_id}")
-            onchain_id = existing_id
-        else:
-            print("   🔐 Creating new identity...")
-            receipt = await create_identity(w3, account, private_key)
-            if not receipt:
-                continue
+                return False
             
-            time.sleep(3)
-            onchain_id = get_onchain_id(w3, account.address)
-            if not onchain_id:
-                print("   ❌ Identity creation failed")
-                continue
-        
-        # Get KYC signature
-        print("   🔐 Getting KYC signature...")
-        kyc_response = get_kyc_signature(account.address, onchain_id)
-        
-        # Check existing claims
-        try:
-            contract = w3.eth.contract(address=onchain_id, abi=IDENTITY_ABI)
-            existing_claims = contract.functions.getClaimIdsByTopic(kyc_response['topic']).call()
-            if existing_claims:
-                print("   ✅ KYC claim already exists")
-                continue
-        except:
-            pass
-        
-        # Add claim
-        print("   🔐 Adding KYC claim...")
-        await add_claim(w3, account, private_key, onchain_id, kyc_response)
-        
-        time.sleep(5)
+            return True
     
-    print("\n🎉 KYC process completed!")
+    async def process_perform_deploy_identity(self, account: str, address: str, use_proxy: bool):
+        tx_hash, block_number, identity_address = await self.perform_deploy_identity(account, address, use_proxy)
+        if tx_hash and block_number and identity_address:
+            explorer = f"https://testnet.pharosscan.xyz/tx/{tx_hash}"
 
-async def buy_tokens():
-    print("\n" + "="*60)
-    print("💰 BUY TOKENS - USDC TO RWA TOKEN")
-    print("="*60)
-    
-    w3 = get_web3()
-    private_keys = load_private_keys()
-    
-    if not private_keys:
-        print("❌ No private keys found!")
-        return
-    
-    # Get user input for transaction parameters
-    try:
-        num_transactions = int(input("Enter number of transactions to perform: "))
-        if num_transactions <= 0:
-            print("❌ Invalid number of transactions!")
-            return
+            self.log(
+                f"{Fore.CYAN+Style.BRIGHT}   Status  :{Style.RESET_ALL}"
+                f"{Fore.GREEN+Style.BRIGHT} Success {Style.RESET_ALL}"
+            )
+            self.log(
+                f"{Fore.CYAN+Style.BRIGHT}   Block   :{Style.RESET_ALL}"
+                f"{Fore.WHITE+Style.BRIGHT} {block_number} {Style.RESET_ALL}"
+            )
+            self.log(
+                f"{Fore.CYAN+Style.BRIGHT}   Tx Hash :{Style.RESET_ALL}"
+                f"{Fore.WHITE+Style.BRIGHT} {tx_hash} {Style.RESET_ALL}"
+            )
+            self.log(
+                f"{Fore.CYAN+Style.BRIGHT}   Explorer:{Style.RESET_ALL}"
+                f"{Fore.WHITE+Style.BRIGHT} {explorer} {Style.RESET_ALL}"
+            )
+            return identity_address
         
-        min_usdc = float(input("Enter minimum USDC amount: "))
-        max_usdc = float(input("Enter maximum USDC amount: "))
-        if min_usdc <= 0 or max_usdc <= 0 or min_usdc > max_usdc:
-            print("❌ Invalid amount range!")
-            return
-        
-        min_delay = int(input("Enter minimum delay between transactions (seconds): "))
-        max_delay = int(input("Enter maximum delay between transactions (seconds): "))
-        if min_delay < 0 or max_delay < 0 or min_delay > max_delay:
-            print("❌ Invalid delay range!")
-            return
-        
-    except ValueError:
-        print("❌ Invalid input!")
-        return
+        else:
+            self.log(
+                f"{Fore.CYAN+Style.BRIGHT}   Status  :{Style.RESET_ALL}"
+                f"{Fore.RED+Style.BRIGHT} Perform On-Chain Failed {Style.RESET_ALL}"
+            )
+            return False
     
-    print(f"\n💰 Will perform {num_transactions} transactions")
-    print(f"   Amount range: {min_usdc} - {max_usdc} USDC")
-    print(f"   Delay range: {min_delay} - {max_delay} seconds")
-    
-    # Confirm before proceeding
-    confirm = input("\nProceed with these settings? (y/n): ").strip().lower()
-    if confirm != 'y':
-        print("❌ Transaction cancelled!")
-        return
-    
-    import random
-    
-    for transaction_num in range(1, num_transactions + 1):
-        print(f"\n" + "="*60)
-        print(f"🔄 TRANSACTION {transaction_num}/{num_transactions}")
-        print("="*60)
+    async def process_perform_add_claim(self, account: str, address: str, signature: bytes, use_proxy: bool):
+        tx_hash, block_number, claim_id = await self.perform_add_claim(account, address, signature, use_proxy)
+        if tx_hash and block_number and claim_id:
+            explorer = f"https://testnet.pharosscan.xyz/tx/{tx_hash}"
+
+            self.log(
+                f"{Fore.CYAN+Style.BRIGHT}   Status  :{Style.RESET_ALL}"
+                f"{Fore.GREEN+Style.BRIGHT} Success {Style.RESET_ALL}"
+            )
+            self.log(
+                f"{Fore.CYAN+Style.BRIGHT}   Block   :{Style.RESET_ALL}"
+                f"{Fore.WHITE+Style.BRIGHT} {block_number} {Style.RESET_ALL}"
+            )
+            self.log(
+                f"{Fore.CYAN+Style.BRIGHT}   Tx Hash :{Style.RESET_ALL}"
+                f"{Fore.WHITE+Style.BRIGHT} {tx_hash} {Style.RESET_ALL}"
+            )
+            self.log(
+                f"{Fore.CYAN+Style.BRIGHT}   Explorer:{Style.RESET_ALL}"
+                f"{Fore.WHITE+Style.BRIGHT} {explorer} {Style.RESET_ALL}"
+            )
+            return claim_id
         
-        # Generate random amount and delay
-        random_usdc = round(random.uniform(min_usdc, max_usdc), 2)
-        random_delay = random.randint(min_delay, max_delay)
-        
-        print(f"💰 Random amount: {random_usdc} USDC")
-        print(f"⏳ Next delay: {random_delay} seconds")
-        
-        for i, private_key in enumerate(private_keys):
-            account = Account.from_key(private_key)
-            print(f"\n📱 Processing Account {i+1}/{len(private_keys)}: {account.address}")
+        else:
+            self.log(
+                f"{Fore.CYAN+Style.BRIGHT}   Status  :{Style.RESET_ALL}"
+                f"{Fore.RED+Style.BRIGHT} Perform On-Chain Failed {Style.RESET_ALL}"
+            )
+            return False
+    
+    async def process_perform_buy_asset(self, account: str, address: str, use_proxy: bool):
+        tx_hash, block_number = await self.perform_buy_asset(account, address, use_proxy)
+        if tx_hash and block_number:
+            explorer = f"https://testnet.pharosscan.xyz/tx/{tx_hash}"
+
+            self.log(
+                f"{Fore.CYAN+Style.BRIGHT}   Status  :{Style.RESET_ALL}"
+                f"{Fore.GREEN+Style.BRIGHT} Success {Style.RESET_ALL}                                   "
+            )
+            self.log(
+                f"{Fore.CYAN+Style.BRIGHT}   Block   :{Style.RESET_ALL}"
+                f"{Fore.WHITE+Style.BRIGHT} {block_number} {Style.RESET_ALL}"
+            )
+            self.log(
+                f"{Fore.CYAN+Style.BRIGHT}   Tx Hash :{Style.RESET_ALL}"
+                f"{Fore.WHITE+Style.BRIGHT} {tx_hash} {Style.RESET_ALL}"
+            )
+            self.log(
+                f"{Fore.CYAN+Style.BRIGHT}   Explorer:{Style.RESET_ALL}"
+                f"{Fore.WHITE+Style.BRIGHT} {explorer} {Style.RESET_ALL}"
+            )
+        else:
+            self.log(
+                f"{Fore.CYAN+Style.BRIGHT}   Status  :{Style.RESET_ALL}"
+                f"{Fore.RED+Style.BRIGHT} Perform On-Chain Failed {Style.RESET_ALL}"
+            )
+    
+    async def process_complete_kyc(self, account: str, address: str, use_proxy):
+        self.log(f"{Fore.CYAN+Style.BRIGHT}KYC     :{Style.RESET_ALL}")
+
+        self.log(
+            f"{Fore.MAGENTA+Style.BRIGHT} ● {Style.RESET_ALL}"
+            f"{Fore.GREEN+Style.BRIGHT}Create Onchain Id{Style.RESET_ALL}"
+        )
+
+        identity_address = await self.get_identity_address(address, use_proxy)
+        if identity_address is None: return False
+
+        if identity_address == self.ZERO_CONTRACT_ADDRESS:
+
+            identity_address = await self.process_perform_deploy_identity(account, address, use_proxy)
+            if not identity_address: return False
+
+        else:
+            self.log(
+                f"{Fore.CYAN+Style.BRIGHT}   Status  :{Style.RESET_ALL}"
+                f"{Fore.YELLOW+Style.BRIGHT} Already Created {Style.RESET_ALL}"
+            )
+
+        self.log(
+            f"{Fore.CYAN+Style.BRIGHT}   Identity:{Style.RESET_ALL}"
+            f"{Fore.BLUE+Style.BRIGHT} {identity_address} {Style.RESET_ALL}"
+        )
+
+        self.identity_address[address] = identity_address
+
+        self.log(
+            f"{Fore.MAGENTA+Style.BRIGHT} ● {Style.RESET_ALL}"
+            f"{Fore.GREEN+Style.BRIGHT}Verification With Signature{Style.RESET_ALL}"
+        )
+
+        claim_ids = await self.get_claim_ids(address, use_proxy)
+        if claim_ids is None: return False
+
+        if len(claim_ids) == 0:
+            proxy_url = self.get_next_proxy_for_account(address) if use_proxy else None
+
+            sign = await self.kyc_signature(address, proxy_url)
+            if not sign: return False
+
+            r = int(sign["signature"]["r"], 16)
+            s = int(sign["signature"]["s"], 16)
+            v = sign["signature"]["v"]
+
+            signature = to_bytes(r) + to_bytes(s) + to_bytes(v)
+
+            claim_id = await self.process_perform_add_claim(account, address, signature, use_proxy)
+            if not claim_id: return False
+
+        else:
+            claim_id = to_hex(claim_ids[0])
+            self.log(
+                f"{Fore.CYAN+Style.BRIGHT}   Status  :{Style.RESET_ALL}"
+                f"{Fore.YELLOW+Style.BRIGHT} Already Verified {Style.RESET_ALL}"
+            )
+
+        self.log(
+            f"{Fore.CYAN+Style.BRIGHT}   Claim Id:{Style.RESET_ALL}"
+            f"{Fore.BLUE+Style.BRIGHT} {claim_id} {Style.RESET_ALL}"
+        )
+
+        return True
+    
+    async def process_trade_buy_asset(self, account: str, address: str, use_proxy: bool):
+        self.log(
+            f"{Fore.MAGENTA+Style.BRIGHT} ● {Style.RESET_ALL}"
+            f"{Fore.GREEN+Style.BRIGHT}Buy Asset{Style.RESET_ALL}"
+        )
+
+        for i in range(self.trade_count):
+            self.log(
+                f"{Fore.GREEN+Style.BRIGHT} ● {Style.RESET_ALL}"
+                f"{Fore.BLUE+Style.BRIGHT}Buy{Style.RESET_ALL}"
+                f"{Fore.WHITE+Style.BRIGHT} {i+1} {Style.RESET_ALL}"
+                f"{Fore.MAGENTA+Style.BRIGHT}Of{Style.RESET_ALL}"
+                f"{Fore.WHITE+Style.BRIGHT} {self.trade_count} {Style.RESET_ALL}                                   "
+            )
+
+            self.log(
+                f"{Fore.CYAN+Style.BRIGHT}   Pair    :{Style.RESET_ALL}"
+                f"{Fore.BLUE+Style.BRIGHT} USDC to SLQD {Style.RESET_ALL}"
+            )
+
+            self.log(
+                f"{Fore.CYAN+Style.BRIGHT}   Amount  :{Style.RESET_ALL}"
+                f"{Fore.WHITE+Style.BRIGHT} {self.usdc_amount} {Style.RESET_ALL}"
+            )
+
+            balance = await self.get_token_balance(address, self.USDC_CONTRACT_ADDRESS, use_proxy)
+
+            self.log(
+                f"{Fore.CYAN+Style.BRIGHT}   Balance :{Style.RESET_ALL}"
+                f"{Fore.WHITE+Style.BRIGHT} {balance} USDC {Style.RESET_ALL}"
+            )
+
+            if balance is None:
+                self.log(
+                    f"{Fore.CYAN+Style.BRIGHT}   Status  :{Style.RESET_ALL}"
+                    f"{Fore.RED+Style.BRIGHT} Fetch USDC Token Balance Failed {Style.RESET_ALL}"
+                )
+                continue
+
+            if balance < self.usdc_amount:
+                self.log(
+                    f"{Fore.CYAN+Style.BRIGHT}   Status  :{Style.RESET_ALL}"
+                    f"{Fore.YELLOW+Style.BRIGHT} Insufficient USDC Token Balance {Style.RESET_ALL}"
+                )
+                return
+
+            await self.process_perform_buy_asset(account, address, use_proxy)
+            await self.print_timer()
+
+    async def process_accounts(self, account: str, address: str, use_proxy: bool, rotate_proxy: bool):
+        is_valid = await self.process_check_connection(address, use_proxy, rotate_proxy)
+        if is_valid:
             
             try:
-                # Check USDC balance
-                usdc_contract = w3.eth.contract(address=w3.to_checksum_address(USDC_CONTRACT), abi=USDC_ABI)
-                usdc_balance = usdc_contract.functions.balanceOf(account.address).call()
-                usdc_decimals = usdc_contract.functions.decimals().call()
-                usdc_balance_formatted = usdc_balance / (10 ** usdc_decimals)
-                
-                print(f"   USDC Balance: {usdc_balance_formatted:.2f} USDC")
-                
-                if usdc_balance_formatted < random_usdc:
-                    print(f"   ❌ Insufficient USDC balance")
-                    continue
-                
-                # Check if identity exists
-                existing_id = get_onchain_id(w3, account.address)
-                if not existing_id:
-                    print(f"   ❌ No identity found - complete KYC first")
-                    continue
-                
-                # Approve USDC spending
-                usdc_amount_wei = int(random_usdc * (10 ** usdc_decimals))
-                orders_contract = w3.eth.contract(address=w3.to_checksum_address(ORDERS_CONTRACT), abi=ORDERS_ABI)
-                
-                print(f"   🔐 Approving USDC spending...")
-                
-                approve_tx = usdc_contract.functions.approve(
-                    w3.to_checksum_address(ORDERS_CONTRACT),
-                    usdc_amount_wei
-                ).build_transaction({
-                    'chainId': CHAIN_ID,
-                    'gas': 100000,
-                    'gasPrice': w3.to_wei('1.25', 'gwei'),
-                    'nonce': w3.eth.get_transaction_count(account.address),
-                    'from': account.address,
-                    'value': 0
-                })
-                
-                signed_approve_tx = w3.eth.account.sign_transaction(approve_tx, private_key)
-                approve_hash = w3.eth.send_raw_transaction(signed_approve_tx.raw_transaction)
-                print(f"   Approval hash: {approve_hash.hex()}")
-                
-                w3.eth.wait_for_transaction_receipt(approve_hash, timeout=60)
-                print(f"   ✅ USDC approved")
-                
-                # Buy tokens
-                print(f"   🚀 Buying RWA tokens...")
-                
-                buy_tx = orders_contract.functions.buyAsset(
-                    2000002,  # feed ID
-                    "LQD",    # ticker
-                    w3.to_checksum_address(RWA_TOKEN_CONTRACT),
-                    usdc_amount_wei
-                ).build_transaction({
-                    'chainId': CHAIN_ID,
-                    'gas': 400000,
-                    'gasPrice': w3.to_wei('1.25', 'gwei'),
-                    'nonce': w3.eth.get_transaction_count(account.address),
-                    'from': account.address,
-                    'value': 0
-                })
-                
-                signed_buy_tx = w3.eth.account.sign_transaction(buy_tx, private_key)
-                buy_hash = w3.eth.send_raw_transaction(signed_buy_tx.raw_transaction)
-                print(f"   Buy hash: {buy_hash.hex()}")
-                
-                receipt = w3.eth.wait_for_transaction_receipt(buy_hash, timeout=60)
-                
-                if receipt.status == 1:
-                    print(f"   ✅ Tokens bought successfully!")
-                else:
-                    print(f"   ❌ Buy transaction failed")
-                
+                web3 = await self.get_web3_with_check(address, use_proxy)
             except Exception as e:
-                print(f"   ❌ Error: {e}")
+                self.log(
+                    f"{Fore.CYAN+Style.BRIGHT}Status  :{Style.RESET_ALL}"
+                    f"{Fore.RED+Style.BRIGHT} Web3 Not Connected {Style.RESET_ALL}"
+                    f"{Fore.MAGENTA+Style.BRIGHT}-{Style.RESET_ALL}"
+                    f"{Fore.YELLOW+Style.BRIGHT} {str(e)} {Style.RESET_ALL}"
+                )
+                return
             
-            time.sleep(3)
-        
-        # Delay before next transaction (except for the last one)
-        if transaction_num < num_transactions:
-            print(f"\n⏳ Waiting {random_delay} seconds before next transaction...")
-            time.sleep(random_delay)
-    
-    print("\n🎉 All buy transactions completed!")
-
-async def sell_tokens():
-    print("\n" + "="*60)
-    print("💸 SELL TOKENS - RWA TOKEN TO USDC")
-    print("="*60)
-    
-    w3 = get_web3()
-    private_keys = load_private_keys()
-    
-    if not private_keys:
-        print("❌ No private keys found!")
-        return
-    
-    # Get user input for transaction parameters
-    try:
-        num_transactions = int(input("Enter number of transactions to perform: "))
-        if num_transactions <= 0:
-            print("❌ Invalid number of transactions!")
-            return
-        
-        min_tokens = float(input("Enter minimum RWA token amount: "))
-        max_tokens = float(input("Enter maximum RWA token amount: "))
-        if min_tokens <= 0 or max_tokens <= 0 or min_tokens > max_tokens:
-            print("❌ Invalid amount range!")
-            return
-        
-        min_delay = int(input("Enter minimum delay between transactions (seconds): "))
-        max_delay = int(input("Enter maximum delay between transactions (seconds): "))
-        if min_delay < 0 or max_delay < 0 or min_delay > max_delay:
-            print("❌ Invalid delay range!")
-            return
-        
-    except ValueError:
-        print("❌ Invalid input!")
-        return
-    
-    print(f"\n💸 Will perform {num_transactions} transactions")
-    print(f"   Amount range: {min_tokens} - {max_tokens} LQD")
-    print(f"   Delay range: {min_delay} - {max_delay} seconds")
-    
-    # Confirm before proceeding
-    confirm = input("\nProceed with these settings? (y/n): ").strip().lower()
-    if confirm != 'y':
-        print("❌ Transaction cancelled!")
-        return
-    
-    import random
-    
-    for transaction_num in range(1, num_transactions + 1):
-        print(f"\n" + "="*60)
-        print(f"🔄 TRANSACTION {transaction_num}/{num_transactions}")
-        print("="*60)
-        
-        # Generate random amount and delay
-        random_tokens = round(random.uniform(min_tokens, max_tokens), 4)
-        random_delay = random.randint(min_delay, max_delay)
-        
-        print(f"💸 Random amount: {random_tokens} LQD")
-        print(f"⏳ Next delay: {random_delay} seconds")
-        
-        for i, private_key in enumerate(private_keys):
-            account = Account.from_key(private_key)
-            print(f"\n📱 Processing Account {i+1}/{len(private_keys)}: {account.address}")
+            self.used_nonce[address] = web3.eth.get_transaction_count(address, "pending")
             
-            try:
-                # Check RWA token balance
-                rwa_contract = w3.eth.contract(address=w3.to_checksum_address(RWA_TOKEN_CONTRACT), abi=RWA_TOKEN_ABI)
-                token_balance = rwa_contract.functions.balanceOf(account.address).call()
-                token_decimals = rwa_contract.functions.decimals().call()
-                token_balance_formatted = token_balance / (10 ** token_decimals)
-                
-                print(f"   RWA Token Balance: {token_balance_formatted:.4f} LQD")
-                
-                if token_balance_formatted < random_tokens:
-                    print(f"   ❌ Insufficient token balance")
-                    continue
-                
-                # Check if identity exists
-                existing_id = get_onchain_id(w3, account.address)
-                if not existing_id:
-                    print(f"   ❌ No identity found - complete KYC first")
-                    continue
-                
-                # Approve token spending
-                token_amount_wei = int(random_tokens * (10 ** token_decimals))
-                orders_contract = w3.eth.contract(address=w3.to_checksum_address(ORDERS_CONTRACT), abi=ORDERS_ABI)
-                
-                print(f"   🔐 Approving token spending...")
-                
-                approve_tx = rwa_contract.functions.approve(
-                    w3.to_checksum_address(ORDERS_CONTRACT),
-                    token_amount_wei
-                ).build_transaction({
-                    'chainId': CHAIN_ID,
-                    'gas': 100000,
-                    'gasPrice': w3.to_wei('1.25', 'gwei'),
-                    'nonce': w3.eth.get_transaction_count(account.address),
-                    'from': account.address,
-                    'value': 0
-                })
-                
-                signed_approve_tx = w3.eth.account.sign_transaction(approve_tx, private_key)
-                approve_hash = w3.eth.send_raw_transaction(signed_approve_tx.raw_transaction)
-                print(f"   Approval hash: {approve_hash.hex()}")
-                
-                w3.eth.wait_for_transaction_receipt(approve_hash, timeout=60)
-                print(f"   ✅ Tokens approved")
-                
-                # Sell tokens
-                print(f"   🚀 Selling RWA tokens...")
-                
-                sell_tx = orders_contract.functions.sellAsset(
-                    2000002,  # feed ID
-                    "LQD",    # ticker
-                    w3.to_checksum_address(RWA_TOKEN_CONTRACT),
-                    token_amount_wei
-                ).build_transaction({
-                    'chainId': CHAIN_ID,
-                    'gas': 400000,
-                    'gasPrice': w3.to_wei('1.25', 'gwei'),
-                    'nonce': w3.eth.get_transaction_count(account.address),
-                    'from': account.address,
-                    'value': 0
-                })
-                
-                signed_sell_tx = w3.eth.account.sign_transaction(sell_tx, private_key)
-                sell_hash = w3.eth.send_raw_transaction(signed_sell_tx.raw_transaction)
-                print(f"   Sell hash: {sell_hash.hex()}")
-                
-                receipt = w3.eth.wait_for_transaction_receipt(sell_hash, timeout=60)
-                
-                if receipt.status == 1:
-                    print(f"   ✅ Tokens sold successfully!")
-                else:
-                    print(f"   ❌ Sell transaction failed")
-                
-            except Exception as e:
-                print(f"   ❌ Error: {e}")
-            
-            time.sleep(3)
-        
-        # Delay before next transaction (except for the last one)
-        if transaction_num < num_transactions:
-            print(f"\n⏳ Waiting {random_delay} seconds before next transaction...")
-            time.sleep(random_delay)
-    
-    print("\n🎉 All sell transactions completed!")
+            is_verifed = await self.process_complete_kyc(account, address, use_proxy)
+            if is_verifed:
+                await self.process_trade_buy_asset(account, address, use_proxy)
 
-def show_menu():
-    print("\n" + "="*60)
-    print("🚀 SPOUT FINANCE BOT - MAIN MENU")
-    print("="*60)
-    print("1. 🔐 KYC Process (Create Identity & Add Claims)")
-    print("2. 💰 Buy RWA Tokens (USDC → RWA)")
-    print("3. 💸 Sell RWA Tokens (RWA → USDC)")
-    print("4. 📊 Check Balances")
-    print("5. 🔍 Check Identity Status")
-    print("6. ❌ Exit")
-    print("="*60)
-
-async def check_balances():
-    print("\n" + "="*60)
-    print("📊 ACCOUNT BALANCES")
-    print("="*60)
-    
-    w3 = get_web3()
-    private_keys = load_private_keys()
-    
-    if not private_keys:
-        print("❌ No private keys found!")
-        return
-    
-    for i, private_key in enumerate(private_keys):
-        account = Account.from_key(private_key)
-        print(f"\n📱 Account {i+1}/{len(private_keys)}: {account.address}")
-        
+    async def main(self):
         try:
-            # ETH balance
-            eth_balance = w3.eth.get_balance(account.address)
-            eth_balance_formatted = w3.from_wei(eth_balance, 'ether')
-            print(f"   PHRS: {eth_balance_formatted:.6f} PHRS")
+            with open('accounts.txt', 'r') as file:
+                accounts = [line.strip() for line in file if line.strip()]
             
-            # USDC balance
-            usdc_contract = w3.eth.contract(address=w3.to_checksum_address(USDC_CONTRACT), abi=USDC_ABI)
-            usdc_balance = usdc_contract.functions.balanceOf(account.address).call()
-            usdc_decimals = usdc_contract.functions.decimals().call()
-            usdc_balance_formatted = usdc_balance / (10 ** usdc_decimals)
-            print(f"   USDC: {usdc_balance_formatted:.2f} USDC")
-            
-            # RWA token balance
-            rwa_contract = w3.eth.contract(address=w3.to_checksum_address(RWA_TOKEN_CONTRACT), abi=RWA_TOKEN_ABI)
-            token_balance = rwa_contract.functions.balanceOf(account.address).call()
-            token_decimals = rwa_contract.functions.decimals().call()
-            token_balance_formatted = token_balance / (10 ** token_decimals)
-            print(f"   RWA: {token_balance_formatted:.4f} LQD")
-            
-            # Identity status
-            existing_id = get_onchain_id(w3, account.address)
-            if existing_id:
-                print(f"   🔐 Identity: {existing_id}")
-            else:
-                print(f"   ❌ No Identity")
-                
-        except Exception as e:
-            print(f"   ❌ Error: {e}")
+            proxy_choice, rotate_proxy = self.print_question()
 
-async def check_identity_status():
-    print("\n" + "="*60)
-    print("🔍 IDENTITY STATUS CHECK")
-    print("="*60)
-    
-    w3 = get_web3()
-    private_keys = load_private_keys()
-    
-    if not private_keys:
-        print("❌ No private keys found!")
-        return
-    
-    for i, private_key in enumerate(private_keys):
-        account = Account.from_key(private_key)
-        print(f"\n📱 Account {i+1}/{len(private_keys)}: {account.address}")
-        
-        try:
-            # Check identity
-            existing_id = get_onchain_id(w3, account.address)
-            if existing_id:
-                print(f"   ✅ Identity: {existing_id}")
-                
-                # Check KYC claims
-                try:
-                    contract = w3.eth.contract(address=existing_id, abi=IDENTITY_ABI)
-                    existing_claims = contract.functions.getClaimIdsByTopic(1).call()
-                    if existing_claims:
-                        print(f"   ✅ KYC Claim: {existing_claims[0].hex()}")
-                    else:
-                        print(f"   ❌ No KYC Claim")
-                except:
-                    print(f"   ❌ Error checking claims")
-            else:
-                print(f"   ❌ No Identity")
-                
-        except Exception as e:
-            print(f"   ❌ Error: {e}")
+            while True:
+                use_proxy = True if proxy_choice == 1 else False
 
-async def main():
-    while True:
-        show_menu()
-        
-        try:
-            choice = input("\nSelect option (1-6): ").strip()
-            
-            if choice == "1":
-                await run_kyc_process()
-            elif choice == "2":
-                await buy_tokens()
-            elif choice == "3":
-                await sell_tokens()
-            elif choice == "4":
-                await check_balances()
-            elif choice == "5":
-                await check_identity_status()
-            elif choice == "6":
-                print("\n👋 Goodbye!")
-                break
-            else:
-                print("❌ Invalid option! Please select 1-6.")
-            
-            input("\nPress Enter to continue...")
-            
-        except KeyboardInterrupt:
-            print("\n\n👋 Goodbye!")
-            break
+                self.clear_terminal()
+                self.welcome()
+                self.log(
+                    f"{Fore.GREEN + Style.BRIGHT}Account's Total: {Style.RESET_ALL}"
+                    f"{Fore.WHITE + Style.BRIGHT}{len(accounts)}{Style.RESET_ALL}"
+                )
+
+                if use_proxy:
+                    await self.load_proxies()
+                
+                separator = "=" * 25
+                for account in accounts:
+                    if account:
+                        address = self.generate_address(account)
+
+                        self.log(
+                            f"{Fore.CYAN + Style.BRIGHT}{separator}[{Style.RESET_ALL}"
+                            f"{Fore.WHITE + Style.BRIGHT} {self.mask_account(address)} {Style.RESET_ALL}"
+                            f"{Fore.CYAN + Style.BRIGHT}]{separator}{Style.RESET_ALL}"
+                        )
+
+                        if not address:
+                            self.log(
+                                f"{Fore.CYAN + Style.BRIGHT}Status  :{Style.RESET_ALL}"
+                                f"{Fore.RED + Style.BRIGHT} Invalid Private Key or Library Version Not Supported {Style.RESET_ALL}"
+                            )
+                            continue
+
+                        await self.process_accounts(account, address, use_proxy, rotate_proxy)
+                        await asyncio.sleep(3)
+
+                self.log(f"{Fore.CYAN + Style.BRIGHT}={Style.RESET_ALL}"*72)
+                seconds = 24 * 60 * 60
+                while seconds > 0:
+                    formatted_time = self.format_seconds(seconds)
+                    print(
+                        f"{Fore.CYAN+Style.BRIGHT}[ Wait for{Style.RESET_ALL}"
+                        f"{Fore.WHITE+Style.BRIGHT} {formatted_time} {Style.RESET_ALL}"
+                        f"{Fore.CYAN+Style.BRIGHT}... ]{Style.RESET_ALL}"
+                        f"{Fore.WHITE+Style.BRIGHT} | {Style.RESET_ALL}"
+                        f"{Fore.BLUE+Style.BRIGHT}All Accounts Have Been Processed.{Style.RESET_ALL}",
+                        end="\r"
+                    )
+                    await asyncio.sleep(1)
+                    seconds -= 1
+
+        except FileNotFoundError:
+            self.log(f"{Fore.RED}File 'accounts.txt' Not Found.{Style.RESET_ALL}")
+            return
         except Exception as e:
-            print(f"\n❌ Error: {e}")
-            input("Press Enter to continue...")
+            self.log(f"{Fore.RED+Style.BRIGHT}Error: {e}{Style.RESET_ALL}")
+            raise e
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    try:
+        bot = Spout()
+        asyncio.run(bot.main())
+    except KeyboardInterrupt:
+        print(
+            f"{Fore.CYAN + Style.BRIGHT}[ {datetime.now().astimezone(wib).strftime('%x %X %Z')} ]{Style.RESET_ALL}"
+            f"{Fore.WHITE + Style.BRIGHT} | {Style.RESET_ALL}"
+            f"{Fore.RED + Style.BRIGHT}[ EXIT ] Spout Finance - BOT{Style.RESET_ALL}                                       "                              
+        )
